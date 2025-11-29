@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Crypto Watcher</title>
+  <link rel="icon" href="/static/favicon1.png"/>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <!-- CHANGED: image-based logo using favicon1.png -->
+      <div id="demotext">Crypto Watcher</div>
+    </div>
+    <div class="totals">
+      <div class="tile total">
+        <div class="tile-label">Portfolio</div>
+        <div id="total-portfolio-usd" class="tile-value">$0.00</div>
+      </div>
+
+      <button class="tile chip chip-btc" data-chain="BTC" aria-pressed="false">
+        <div class="chip-head"><span class="chip-dot"></span><span>BTC</span><span class="chip-status">OK</span></div>
+        <div class="chip-value" data-chain="BTC" data-mode="usd">$0.00</div>
+      </button>
+
+      <button class="tile chip chip-eth" data-chain="ETH" aria-pressed="false">
+        <div class="chip-head"><span class="chip-dot"></span><span>ETH</span><span class="chip-status">OK</span></div>
+        <div class="chip-value" data-chain="ETH" data-mode="usd">$0.00</div>
+      </button>
+
+      <button class="tile chip chip-trx" data-chain="TRX" aria-pressed="false">
+        <div class="chip-head"><span class="chip-dot"></span><span>TRX</span><span class="chip-status">OK</span></div>
+        <div class="chip-value" data-chain="TRX" data-mode="usd">$0.00</div>
+      </button>
+
+      <button class="tile chip chip-usdt" data-chain="USDT_TRX" aria-pressed="false">
+        <div class="chip-head"><span class="chip-dot"></span><span>USDT-TRX</span><span class="chip-status">OK</span></div>
+        <div class="chip-value" data-chain="USDT_TRX" data-mode="usd">$0.00</div>
+      </button>
+
+      <button class="tile chip chip-usdt" data-chain="USDT_ETH" aria-pressed="false">
+        <div class="chip-head"><span class="chip-dot"></span><span>USDT-ETH</span><span class="chip-status">OK</span></div>
+        <div class="chip-value" data-chain="USDT_ETH" data-mode="usd">$0.00</div>
+      </button>
+
+      <button class="tile chip chip-usdc" data-chain="USDC_ETH" aria-pressed="false">
+        <div class="chip-head"><span class="chip-dot"></span><span>USDC</span><span class="chip-status">OK</span></div>
+        <div class="chip-value" data-chain="USDC_ETH" data-mode="usd">$0.00</div>
+      </button>
+    </div>
+  </header>
+
+  <main class="main">
+    <section class="toolbar">
+      <div class="row">
+        <label class="field"><span>Search</span><input id="filter-search" type="search" placeholder="Label or address"/></label>
+        <label class="field"><span>Min $</span><input id="filter-min-usd" type="number" inputmode="decimal" placeholder="0"/></label>
+        <label class="field"><span>Max $</span><input id="filter-max-usd" type="number" inputmode="decimal" placeholder="∞"/></label>
+        <div class="spacer"></div>
+        <button id="check-now-btn" class="btn primary">Check now</button>
+        <label class="field-inline"><input id="auto-check-toggle" type="checkbox"/><span>Auto</span></label>
+        <input id="auto-check-interval" class="interval" type="number" min="15" max="3600" value="60" aria-label="Auto interval (s)"/>
+      </div>
+
+      <details class="drawer">
+        <summary>➕ Add wallet</summary>
+        <div class="drawer-body">
+          <label class="field"><span>Chain</span>
+            <select id="add-chain">
+              <option>BTC</option><option>ETH</option><option>TRX</option>
+              <option>USDT_TRX</option><option>USDT_ETH</option><option>USDC_ETH</option>
+            </select>
+          </label>
+          <label class="field"><span>Address</span><input id="add-address" type="text" placeholder="Wallet address"/></label>
+          <label class="field"><span>Label</span><input id="add-label" type="text" placeholder="Optional"/></label>
+          <label class="field"><span>Notes</span><input id="add-notes" type="text" placeholder="Optional"/></label>
+          <button id="add-wallet-btn" class="btn primary">Add</button>
+        </div>
+      </details>
+
+      <details class="drawer">
+        <summary>📥 Bulk import</summary>
+        <div class="drawer-body">
+          <label class="field"><span>Chain</span>
+            <select id="bulk-chain">
+              <option>BTC</option><option>ETH</option><option>TRX</option>
+              <option>USDT_TRX</option><option>USDT_ETH</option><option>USDC_ETH</option>
+            </select>
+          </label>
+          <label class="field col-2"><span>Lines</span><textarea id="bulk-lines" rows="4" placeholder="address[,label] per line"></textarea></label>
+          <button id="bulk-import-btn" class="btn">Import</button>
+          <button id="delete-all-btn" class="btn danger">Delete all</button>
+        </div>
+      </details>
+    </section>
+
+    <section class="grid-wrap" aria-live="polite">
+      <div id="wallet-count" class="count">0 wallets</div>
+      <div id="wallet-cards" class="grid"></div>
+    </section>
+
+    <section class="notifications">
+      <div id="notifications-container" class="notifications-container" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <div id="edit-modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+    <div class="modal">
+      <h2 id="edit-modal-title">Edit wallet</h2>
+      <label class="field"><span>Label</span><input id="edit-label" type="text"/></label>
+      <label class="field"><span>Notes</span><input id="edit-notes" type="text"/></label>
+      <div class="modal-actions">
+        <button id="edit-cancel-btn" class="btn">Cancel</button>
+        <button id="edit-save-btn" class="btn primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/script.js" defer></script>
+</body>
+</html>
