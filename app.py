@@ -1,12 +1,11 @@
 # app.py  (FULL FILE – drop-in)
-import os
+import os, sys
 import json
 import base64
 import asyncio
 import threading
 import webbrowser
 from typing import List, Dict, Tuple, Optional
-
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
@@ -14,9 +13,26 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
 
-DATA_FILE = "wallets.json"
-STATIC_DIR = "static"
+APP_NAME = "CryptoWatcher"
+
+def _base_dir():
+    return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+
+def _user_data_dir():
+    # default if CW_DATA_DIR is not set (dev/local)
+    home = os.path.expanduser("~")
+    d = os.path.join(home, "Library", "Application Support", APP_NAME) if sys.platform=="darwin" \
+        else os.path.join(home, f".{APP_NAME.lower()}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+BASE_DIR = _base_dir()
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+DATA_ROOT = os.getenv("CW_DATA_DIR", _user_data_dir())   # <- override on Railway
+os.makedirs(DATA_ROOT, exist_ok=True)
+DATA_FILE = os.path.join(DATA_ROOT, "wallets.json")
 FAVICON_FILE = os.path.join(STATIC_DIR, "favicon1.png")
+
 
 BTC_SATOSHIS = 100_000_000
 ETH_WEI = 10**18
@@ -576,3 +592,4 @@ if __name__ == "__main__":
     timer.daemon = True
     timer.start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
