@@ -550,19 +550,126 @@ async def delete_all_wallets():
 @app.post("/api/check")
 async def check_wallets():
     wallets = await load_wallets()
+
+    # Track which chains hit rate limits
     chain_rate_limited: Dict[str, bool] = {c: False for c in CANONICAL_CHAINS}
 
-    async def update_wallet_balance(w: Dict) -> Optional[int]:
+    async def update_wallet_balance(w: Dict) -> List[int]:
+        """
+        Updates the main wallet balance, AND (for ETH/TRX wallets) also
+        checks their associated USDT/USDC balances on the same address.
+
+        Returns a list of wallet IDs where the raw balance increased.
+        """
+        deposit_ids: List[int] = []
+
+        # 1) Update the main chain for this wallet
         old_raw = int(w.get("last_raw_balance", 0) or 0)
         new_raw, rl = await fetch_chain_raw_balance(w["chain"], w["address"], old_raw)
-        if rl: chain_rate_limited[w["chain"]] = True
-        w["last_raw_balance"] = int(new_raw)
-        return w["id"] if new_raw > old_raw else None
 
-    deposits = await asyncio.gather(*(update_wallet_balance(w) for w in wallets))
-    deposits = [d for d in deposits if d is not None]
+        if rl:
+            chain_rate_limited[w["chain"]] = True
+
+        w["last_raw_balance"] = int(new_raw)
+        if new_raw > old_raw:
+            deposit_ids.append(w["id"])
+
+        # 2) Extra ERC20 balances for ETH wallets (USDT & USDC on the same address)
+        if w["chain"] == "ETH":
+            for token_chain, token_contract in [
+                ("USDT_ETH", ERC20_USDT),
+                ("USDC_ETH", ERC20_USDC),
+            ]:
+                # find existing wallet for this token/address
+                token_wallet = next(
+                    (
+                        x
+                        for x in wallets
+                        if x["chain"] == token_chain and x["address"] == w["address"]
+                    ),
+                    None,
+                )
+
+                prev_token_raw = int(
+                    token_wallet.get("last_raw_balance", 0) or 0
+                ) if token_wallet else 0
+
+                token_raw, rl_token = await fetch_erc20_raw_balance(
+                    w["address"], token_contract, prev_token_raw
+                )
+
+                if rl_token:
+                    chain_rate_limited[token_chain] = True
+
+                # Always ensure the token wallet exists, even if balance is 0
+                if token_wallet is None:
+                    token_wallet = {
+                        "id": next_wallet_id(wallets),
+                        "chain": token_chain,
+                        "address": w["address"],
+                        "label": w.get("label", "") or "",
+                        "notes": w.get("notes", "") or "",
+                        "last_raw_balance": int(token_raw),
+                    }
+                    wallets.append(token_wallet)
+                else:
+                    token_wallet["last_raw_balance"] = int(token_raw)
+
+                if token_raw > prev_token_raw:
+                    deposit_ids.append(token_wallet["id"])
+
+        # 3) TRC20 USDT for TRX wallets (same address)
+        if w["chain"] == "TRX":
+            token_chain = "USDT_TRX"
+
+            token_wallet = next(
+                (
+                    x
+                    for x in wallets
+                    if x["chain"] == token_chain and x["address"] == w["address"]
+                ),
+                None,
+            )
+
+            prev_token_raw = int(
+                token_wallet.get("last_raw_balance", 0) or 0
+            ) if token_wallet else 0
+
+            token_raw, rl_token = await fetch_trc20_raw_balance(
+                w["address"], TRC20_USDT, prev_token_raw
+            )
+
+            if rl_token:
+                chain_rate_limited[token_chain] = True
+
+            # Always ensure the TRC20 token wallet exists, even if balance is 0
+            if token_wallet is None:
+                token_wallet = {
+                    "id": next_wallet_id(wallets),
+                    "chain": token_chain,
+                    "address": w["address"],
+                    "label": w.get("label", "") or "",
+                    "notes": w.get("notes", "") or "",
+                    "last_raw_balance": int(token_raw),
+                }
+                wallets.append(token_wallet)
+            else:
+                token_wallet["last_raw_balance"] = int(token_raw)
+
+            if token_raw > prev_token_raw:
+                deposit_ids.append(token_wallet["id"])
+
+        return deposit_ids
+
+    # Run balance updates for all wallets in parallel
+    deposit_lists = await asyncio.gather(*(update_wallet_balance(w) for w in wallets))
+    # Flatten list of lists into a single list of wallet IDs with new deposits
+    deposits = [wid for sub in deposit_lists for wid in sub if wid is not None]
+
+    # Persist new balances (including auto-created token wallets)
     await save_wallets(wallets)
 
+    # Build response with USD prices and totals
     prices = await fetch_usd_prices()
     wallets_with_balances, total_usd = build_wallets_with_balances(wallets, prices)
 
@@ -570,7 +677,8 @@ async def check_wallets():
         c: {
             "status": "cooldown" if chain_rate_limited.get(c) else "ok",
             "cooldown_remaining": 8 if chain_rate_limited.get(c) else 0,
-        } for c in CANONICAL_CHAINS
+        }
+        for c in CANONICAL_CHAINS
     }
 
     return {
@@ -592,3 +700,4 @@ if __name__ == "__main__":
     timer.daemon = True
     timer.start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
