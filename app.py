@@ -1,630 +1,594 @@
-# app.py
-import asyncio
-import base64
+# app.py  (FULL FILE – drop-in)
+import os, sys
 import json
-import os
+import base64
+import asyncio
 import threading
-import time
 import webbrowser
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+from typing import List, Dict, Tuple, Optional
 import httpx
-from fastapi import FastAPI, HTTPException, Path as FPath
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
+import uvicorn
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-WALLETS_FILE = BASE_DIR / "wallets.json"
-FAVICON_PATH = STATIC_DIR / "favicon1.png"
+APP_NAME = "CryptoWatcher"
 
-SUPPORTED_CHAINS = {"BTC", "ETH", "TRX"}
+def _base_dir():
+    return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 
-ETH_USDT_CONTRACT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-ETH_USDC_CONTRACT = "0xA0b86991C6218b36c1d19D4a2e9Eb0cE3606EB48"
-TRX_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+def _user_data_dir():
+    # default if CW_DATA_DIR is not set (dev/local)
+    home = os.path.expanduser("~")
+    d = os.path.join(home, "Library", "Application Support", APP_NAME) if sys.platform=="darwin" \
+        else os.path.join(home, f".{APP_NAME.lower()}")
+    os.makedirs(d, exist_ok=True)
+    return d
 
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "").strip()
-TRONSCAN_API_KEY = os.getenv("TRONSCAN_API_KEY", "").strip()
-
-
-def ensure_static_and_wallets():
-    STATIC_DIR.mkdir(exist_ok=True)
-    if not WALLETS_FILE.exists():
-        WALLETS_FILE.write_text("[]", encoding="utf-8")
-    # Fallback favicon (1x1 transparent PNG)
-    if not FAVICON_PATH.exists():
-        tiny_png_base64 = (
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAr8B9p/SUXgAAAAASUVORK5CYII="
-        )
-        FAVICON_PATH.write_bytes(base64.b64decode(tiny_png_base64))
+BASE_DIR = _base_dir()
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+DATA_ROOT = os.getenv("CW_DATA_DIR", _user_data_dir())   # <- override on Railway
+os.makedirs(DATA_ROOT, exist_ok=True)
+DATA_FILE = os.path.join(DATA_ROOT, "wallets.json")
+FAVICON_FILE = os.path.join(STATIC_DIR, "favicon1.png")
 
 
-ensure_static_and_wallets()
+BTC_SATOSHIS = 100_000_000
+ETH_WEI = 10**18
+TRX_SUN = 1_000_000
+DECIMALS_6 = 1_000_000
 
-app = FastAPI(title="Crypto Watcher")
+# Canonical chain codes we store
+CANONICAL_CHAINS = {"BTC", "ETH", "TRX", "USDT_TRX", "USDT_ETH", "USDC_ETH"}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ERC20 contracts (mainnet)
+ERC20_USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # 6 decimals
+ERC20_USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # 6 decimals
+TRC20_USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"          # 6 decimals
+
+HTTP_TIMEOUT = 14.0
+
+FAVICON_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+wallets_lock = asyncio.Lock()
 
+def ensure_files() -> None:
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    if not os.path.exists(FAVICON_FILE):
+        try:
+            with open(FAVICON_FILE, "wb") as f:
+                f.write(base64.b64decode(FAVICON_BASE64))
+        except Exception:
+            pass
 
-class Wallet(BaseModel):
-    id: int
-    chain: str
+ensure_files()
+
+app = FastAPI(title="Crypto Watcher")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# ---------- Models ----------
+
+class WalletCreate(BaseModel):
+    chain: str = Field(..., description="BTC|ETH|TRX|USDT_TRX|USDT_ETH|USDC_ETH (aliases allowed)")
     address: str
-    label: str = ""
-    notes: str = ""
-    last_raw_balance: int = 0
+    label: Optional[str] = None
+    notes: Optional[str] = None
 
-    @validator("chain")
-    def validate_chain(cls, v: str) -> str:
-        if v not in SUPPORTED_CHAINS:
-            raise ValueError("Unsupported chain")
-        return v
-
-
-class TokenBalance(BaseModel):
-    symbol: str          # e.g. "USDT", "USDC"
-    standard: str        # e.g. "ERC20", "TRC20"
-    raw_balance: int
-    coin_balance: float
-    usd_balance: float
-
-
-class WalletWithBalances(Wallet):
-    raw_balance: int
-    coin_balance: float
-    usd_balance: float
-    tokens: List[TokenBalance] = Field(default_factory=list)
-
-
-class AddWalletRequest(BaseModel):
-    chain: str
-    address: str
-    label: Optional[str] = ""
-    notes: Optional[str] = ""
-
-    @validator("chain")
-    def validate_chain(cls, v: str) -> str:
-        if v not in SUPPORTED_CHAINS:
-            raise ValueError("Unsupported chain")
-        return v
-
-    @validator("address")
-    def validate_address(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Address cannot be empty")
-        return v
-
+class WalletUpdate(BaseModel):
+    label: Optional[str] = None
+    notes: Optional[str] = None
 
 class BulkImportRequest(BaseModel):
     chain: str
     lines: str
 
-    @validator("chain")
-    def validate_chain(cls, v: str) -> str:
-        if v not in SUPPORTED_CHAINS:
-            raise ValueError("Unsupported chain")
-        return v
+# ---------- Chain normalization & validators ----------
 
+def normalize_chain(chain: str) -> str:
+    """WHY: Accept user-friendly aliases and map to canonical codes."""
+    c = (chain or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "USDC": "USDC_ETH",
+        "ERC20_USDC": "USDC_ETH",
+        "USDC_ETH": "USDC_ETH",
 
-class UpdateWalletRequest(BaseModel):
-    label: Optional[str] = None
-    notes: Optional[str] = None
+        "USDT": "USDT_ETH",           # default USDT to ETH if ambiguous
+        "ERC20_USDT": "USDT_ETH",
+        "USDT_ETH": "USDT_ETH",
 
+        "TRC20_USDT": "USDT_TRX",
+        "USDT_TRX": "USDT_TRX",
+    }
+    if c in {"BTC", "ETH", "TRX"}:
+        return c
+    return aliases.get(c, c)
 
-class CheckResponse(BaseModel):
-    wallets: List[WalletWithBalances]
-    total_usd: float
-    usd_prices: Dict[str, float]
-    deposits: List[int]
-    chain_status: Dict[str, Dict[str, float]]
+def is_valid_btc_address(addr: str) -> bool:
+    return isinstance(addr, str) and 26 <= len(addr) <= 62 and (addr.startswith("1") or addr.startswith("3") or addr.startswith("bc1"))
 
-
-def load_wallets() -> List[Wallet]:
+def is_valid_eth_address(addr: str) -> bool:
+    if not isinstance(addr, str) or len(addr) != 42 or not addr.startswith("0x"):
+        return False
     try:
-        raw = WALLETS_FILE.read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else []
-        if not isinstance(data, list):
-            data = []
-    except Exception:
-        data = []
-    wallets: List[Wallet] = []
-    for item in data:
-        try:
-            wallets.append(Wallet(**item))
-        except Exception:
-            continue
-    return wallets
+        int(addr[2:], 16)
+        return True
+    except ValueError:
+        return False
 
+def is_valid_trx_address(addr: str) -> bool:
+    return isinstance(addr, str) and addr.startswith("T") and 26 <= len(addr) <= 36
 
-def save_wallets(wallets: List[Wallet]) -> None:
-    serializable = [w.dict() for w in wallets]
-    WALLETS_FILE.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+def validate_address(chain: str, address: str) -> None:
+    c = normalize_chain(chain)
+    ok = (
+        is_valid_btc_address(address) if c == "BTC"
+        else is_valid_eth_address(address) if c in {"ETH", "USDT_ETH", "USDC_ETH"}
+        else is_valid_trx_address(address) if c in {"TRX", "USDT_TRX"}
+        else False
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Invalid {c} address format")
 
+# ---------- HTTP client & test hook ----------
 
-async def fetch_usd_prices(client: httpx.AsyncClient) -> Dict[str, float]:
-    # Include stablecoins for token balances
-    default_prices = {"BTC": 0.0, "ETH": 0.0, "TRX": 0.0, "USDT": 1.0, "USDC": 1.0}
-    try:
-        url = (
-            "https://api.coingecko.com/api/v3/simple/price"
-            "?ids=bitcoin,ethereum,tron,tether,usd-coin&vs_currencies=usd"
+_client: Optional[httpx.AsyncClient] = None
+
+def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": "CryptoWatcher/1.2"},
         )
-        resp = await client.get(url, timeout=10)
-        if resp.status_code != 200:
-            return default_prices
-        data = resp.json()
-        return {
-            "BTC": float(data.get("bitcoin", {}).get("usd", 0.0)),
-            "ETH": float(data.get("ethereum", {}).get("usd", 0.0)),
-            "TRX": float(data.get("tron", {}).get("usd", 0.0)),
-            "USDT": float(data.get("tether", {}).get("usd", 1.0)),
-            "USDC": float(data.get("usd-coin", {}).get("usd", 1.0)),
-        }
-    except Exception:
-        return default_prices
+    return _client
 
+def set_http_client_for_tests(client: httpx.AsyncClient) -> None:
+    global _client
+    _client = client
 
-async def get_raw_balance_for_wallet(
-    client: httpx.AsyncClient, wallet: Wallet
-) -> Tuple[int, bool]:
-    """
-    Returns (new_raw_balance, is_429).
+# ---------- Prices ----------
 
-    - On HTTP 429: returns (old_balance, True)
-    - On any other error: returns (0, False)
-    - On success: returns (raw_balance, False)
-    """
-    chain = wallet.chain
-    address = wallet.address
-    old = wallet.last_raw_balance
-
+async def fetch_usd_prices() -> Dict[str, float]:
+    # Stablecoins default to 1.0 USD
+    base = {"BTC": 0.0, "ETH": 0.0, "TRX": 0.0, "USDT_TRX": 1.0, "USDT_ETH": 1.0, "USDC_ETH": 1.0}
+    url = ("https://api.coingecko.com/api/v3/simple/price"
+           "?ids=bitcoin,ethereum,tron&vs_currencies=usd")
     try:
-        if chain == "BTC":
-            url = f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance"
-            resp = await client.get(url, timeout=10)
-            if resp.status_code == 429:
-                return old, True
-            if resp.status_code != 200:
-                return 0, False
-            data = resp.json()
-            raw = int(data.get("final_balance", 0))
-            return raw, False
-
-        if chain == "ETH":
-            url = f"https://api.blockcypher.com/v1/eth/main/addrs/{address}/balance"
-            resp = await client.get(url, timeout=10)
-            if resp.status_code == 429:
-                return old, True
-            if resp.status_code != 200:
-                return 0, False
-            data = resp.json()
-            raw = int(data.get("final_balance", 0))
-            return raw, False
-
-        if chain == "TRX":
-            url = f"https://apilist.tronscan.org/api/account?address={address}"
-            resp = await client.get(url, timeout=10)
-            if resp.status_code == 429:
-                return old, True
-            if resp.status_code != 200:
-                return 0, False
-            data = resp.json()
-            bal = data.get("balance", 0)
-            try:
-                raw = int(bal)
-            except Exception:
-                raw = 0
-            return raw, False
-
-    except Exception:
-        return 0, False
-
-    return old, False
-
-
-async def fetch_erc20_token_balance(
-    client: httpx.AsyncClient, address: str, contract: str
-) -> Optional[int]:
-    if not ETHERSCAN_API_KEY:
-        return None
-    try:
-        params = {
-            "module": "account",
-            "action": "tokenbalance",
-            "contractaddress": contract,
-            "address": address,
-            "tag": "latest",
-            "apikey": ETHERSCAN_API_KEY,
-        }
-        resp = await client.get("https://api.etherscan.io/api", params=params, timeout=10)
-        if resp.status_code == 429:
-            # skip updating token (treat as "no change")
-            return None
-        if resp.status_code != 200:
-            return 0
-        data = resp.json()
-        result = data.get("result")
-        if result is None:
-            return 0
-        return int(result)
-    except Exception:
-        return 0
-
-
-async def fetch_eth_tokens(client: httpx.AsyncClient, address: str) -> Dict[str, int]:
-    """
-    Returns a dict like {"USDT_ERC20": raw, "USDC_ERC20": raw}
-    """
-    balances: Dict[str, int] = {}
-    usdt_raw = await fetch_erc20_token_balance(client, address, ETH_USDT_CONTRACT)
-    if usdt_raw is not None:
-        balances["USDT_ERC20"] = usdt_raw
-    usdc_raw = await fetch_erc20_token_balance(client, address, ETH_USDC_CONTRACT)
-    if usdc_raw is not None:
-        balances["USDC_ERC20"] = usdc_raw
-    return balances
-
-
-async def fetch_trc20_usdt_balance(
-    client: httpx.AsyncClient, address: str
-) -> Optional[int]:
-    if not TRONSCAN_API_KEY:
-        return None
-    try:
-        params = {
-            "contract_address": TRX_USDT_CONTRACT,
-            "holder_address": address,
-            "start": 0,
-            "limit": 1,
-        }
-        headers = {"TRON-PRO-API-KEY": TRONSCAN_API_KEY}
-        resp = await client.get(
-            "https://apilist.tronscanapi.com/api/token_trc20/holders",
-            params=params,
-            headers=headers,
-            timeout=10,
-        )
-        if resp.status_code == 429:
-            return None
-        if resp.status_code != 200:
-            return 0
-        data = resp.json()
-        holders = data.get("data") or data.get("trc20_tokens") or []
-        if not holders:
-            return 0
-        raw = (
-            holders[0].get("balance")
-            or holders[0].get("quantity")
-            or holders[0].get("amount")
-            or "0"
-        )
-        return int(raw)
-    except Exception:
-        return 0
-
-
-async def fetch_trx_tokens(client: httpx.AsyncClient, address: str) -> Dict[str, int]:
-    balances: Dict[str, int] = {}
-    usdt_raw = await fetch_trc20_usdt_balance(client, address)
-    if usdt_raw is not None:
-        balances["USDT_TRC20"] = usdt_raw
-    return balances
-
-
-def build_wallets_with_balances(
-    wallets: List[Wallet],
-    prices: Dict[str, float],
-    token_raws_list: Optional[List[Dict[str, int]]] = None,
-) -> List[WalletWithBalances]:
-    result: List[WalletWithBalances] = []
-    for idx, w in enumerate(wallets):
-        raw = w.last_raw_balance
-        if w.chain == "BTC":
-            coin = raw / 1e8
-            native_price = prices.get("BTC", 0.0)
-        elif w.chain == "ETH":
-            coin = raw / 1e18
-            native_price = prices.get("ETH", 0.0)
-        elif w.chain == "TRX":
-            coin = raw / 1e6
-            native_price = prices.get("TRX", 0.0)
-        else:
-            coin = 0.0
-            native_price = 0.0
-
-        native_usd = coin * native_price
-
-        token_list: List[TokenBalance] = []
-        token_raws: Dict[str, int] = {}
-        if token_raws_list is not None and idx < len(token_raws_list):
-            token_raws = token_raws_list[idx] or {}
-
-        # ETH tokens: USDT_ERC20, USDC_ERC20
-        if w.chain == "ETH":
-            usdt_raw = token_raws.get("USDT_ERC20")
-            if usdt_raw is not None:
-                usdt_coin = usdt_raw / 1e6
-                token_list.append(
-                    TokenBalance(
-                        symbol="USDT",
-                        standard="ERC20",
-                        raw_balance=usdt_raw,
-                        coin_balance=usdt_coin,
-                        usd_balance=usdt_coin * prices.get("USDT", 1.0),
-                    )
-                )
-            usdc_raw = token_raws.get("USDC_ERC20")
-            if usdc_raw is not None:
-                usdc_coin = usdc_raw / 1e6
-                token_list.append(
-                    TokenBalance(
-                        symbol="USDC",
-                        standard="ERC20",
-                        raw_balance=usdc_raw,
-                        coin_balance=usdc_coin,
-                        usd_balance=usdc_coin * prices.get("USDC", 1.0),
-                    )
-                )
-
-        # TRX tokens: USDT_TRC20
-        if w.chain == "TRX":
-            usdt_trc_raw = token_raws.get("USDT_TRC20")
-            if usdt_trc_raw is not None:
-                usdt_coin = usdt_trc_raw / 1e6
-                token_list.append(
-                    TokenBalance(
-                        symbol="USDT",
-                        standard="TRC20",
-                        raw_balance=usdt_trc_raw,
-                        coin_balance=usdt_coin,
-                        usd_balance=usdt_coin * prices.get("USDT", 1.0),
-                    )
-                )
-
-        result.append(
-            WalletWithBalances(
-                **w.dict(),
-                raw_balance=raw,
-                coin_balance=coin,
-                usd_balance=native_usd,
-                tokens=token_list,
-            )
-        )
-    return result
-
-
-def compute_total_usd(wallets_with_balances: List[WalletWithBalances]) -> float:
-    total = 0.0
-    for w in wallets_with_balances:
-        total += w.usd_balance
-        for t in w.tokens:
-            total += t.usd_balance
-    return float(total)
-
-
-def auto_open_browser():
-    time.sleep(1.2)
-    try:
-        webbrowser.open("http://localhost:8000", new=2)
+        r = await get_client().get(url)
+        if r.status_code == 200:
+            data = r.json()
+            base["BTC"] = float(data.get("bitcoin", {}).get("usd", 0.0) or 0.0)
+            base["ETH"] = float(data.get("ethereum", {}).get("usd", 0.0) or 0.0)
+            base["TRX"] = float(data.get("tron", {}).get("usd", 0.0) or 0.0)
     except Exception:
         pass
+    return base
 
+# ---------- Conversions ----------
 
-@app.on_event("startup")
-async def on_startup():
-    ensure_static_and_wallets()
-    threading.Thread(target=auto_open_browser, daemon=True).start()
+def to_coin_balance(chain: str, raw: int) -> float:
+    c = normalize_chain(chain)
+    if c == "BTC": return raw / BTC_SATOSHIS
+    if c == "ETH": return raw / ETH_WEI
+    if c == "TRX": return raw / TRX_SUN
+    if c in {"USDT_TRX", "USDT_ETH", "USDC_ETH"}: return raw / DECIMALS_6
+    return 0.0
 
+def build_wallet_response(wallet: Dict, prices: Dict[str, float]) -> Dict:
+    c = normalize_chain(wallet["chain"])
+    raw = int(wallet.get("last_raw_balance", 0) or 0)
+    coin_balance = to_coin_balance(c, raw)
+    usd_price = float(prices.get(c if c in prices else "ETH", 0.0) or 0.0)
+    usd_balance = coin_balance * usd_price
+    return {
+        "id": wallet["id"],
+        "chain": c,  # respond with canonical
+        "address": wallet["address"],
+        "label": wallet.get("label", "") or "",
+        "notes": wallet.get("notes", "") or "",
+        "last_raw_balance": raw,
+        "raw_balance": raw,
+        "coin_balance": coin_balance,
+        "usd_balance": usd_balance,
+    }
 
-@app.get("/", include_in_schema=False)
-async def root():
-    index_path = STATIC_DIR / "index.html"
-    if not index_path.exists():
-        raise HTTPException(status_code=404, detail="index.html not found")
-    return FileResponse(str(index_path))
+def build_wallets_with_balances(wallets: List[Dict], prices: Dict[str, float]) -> Tuple[List[Dict], float]:
+    res, total = [], 0.0
+    for w in wallets:
+        out = build_wallet_response(w, prices)
+        total += float(out["usd_balance"])
+        res.append(out)
+    return res, total
 
+# ---------- Fetch helpers ----------
 
-@app.get("/favicon.ico", include_in_schema=False)
+async def _retry(call, *args, previous: int) -> Tuple[int, bool]:
+    rate_limited = False
+    for attempt in range(3):
+        try:
+            raw, rl = await call(*args, previous=previous)
+            rate_limited = rate_limited or rl
+            return raw, rate_limited
+        except Exception:
+            await asyncio.sleep(0.25 * (attempt + 1))
+    return previous, rate_limited
+
+# --- BTC ---
+
+async def _btc_blockstream(address: str, *, previous: int) -> Tuple[int, bool]:
+    r = await get_client().get(f"https://blockstream.info/api/address/{address}")
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    d = r.json()
+    cs, ms = d.get("chain_stats", {}) or {}, d.get("mempool_stats", {}) or {}
+    funded = int(cs.get("funded_txo_sum", 0)) + int(ms.get("funded_txo_sum", 0))
+    spent  = int(cs.get("spent_txo_sum", 0))  + int(ms.get("spent_txo_sum", 0))
+    return max(funded - spent, 0), False
+
+async def _btc_blockcypher(address: str, *, previous: int) -> Tuple[int, bool]:
+    r = await get_client().get(f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance")
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    return int(r.json().get("balance", 0) or 0), False
+
+async def fetch_btc_raw_balance(address: str, previous: int) -> Tuple[int, bool]:
+    try:
+        return await _retry(_btc_blockstream, address, previous=previous)
+    except Exception:
+        return await _retry(_btc_blockcypher, address, previous=previous)
+
+# --- ETH native (beefed up) ---
+
+ETH_RPCS = [
+    "https://cloudflare-eth.com",
+    "https://rpc.ankr.com/eth",
+    "https://ethereum.publicnode.com",
+]
+
+async def _eth_rpc_get_balance(rpc: str, address: str, *, previous: int) -> Tuple[int, bool]:
+    payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
+    r = await get_client().post(rpc, json=payload)
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    result = (r.json() or {}).get("result")
+    if not isinstance(result, str) or not result.startswith("0x"):
+        return previous, False
+    return int(result, 16), False
+
+async def _etherscan_balance(address: str, *, previous: int) -> Tuple[int, bool]:
+    # Public no-key endpoint (rate limited but works as a final fallback)
+    url = f"https://api.etherscan.io/api?module=account&action=balance&address={address}&tag=latest"
+    r = await get_client().get(url)
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    data = r.json()
+    if str(data.get("status")) == "1":
+        return int(data.get("result") or "0"), False
+    return previous, False
+
+async def fetch_eth_raw_balance(address: str, previous: int) -> Tuple[int, bool]:
+    last_exc = None
+    rate_limited = False
+    for rpc in ETH_RPCS:
+        try:
+            raw, rl = await _eth_rpc_get_balance(rpc, address, previous=previous)
+            rate_limited = rate_limited or rl
+            if raw != previous or rl:
+                return raw, rate_limited
+        except Exception as e:
+            last_exc = e
+            continue
+    try:
+        return await _retry(_etherscan_balance, address, previous=previous)
+    except Exception:
+        if last_exc:
+            # WHY: ensure endpoint doesn't silently stay at 0 on persistent failures
+            raise last_exc
+        raise
+
+# --- TRX native ---
+
+async def _trx_trongrid(address: str, *, previous: int) -> Tuple[int, bool]:
+    r = await get_client().get(f"https://api.trongrid.io/v1/accounts/{address}")
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    data = r.json()
+    arr = data.get("data") or []
+    if not arr: return 0, False
+    return int(arr[0].get("balance", 0) or 0), False
+
+async def _trx_tronscan(address: str, *, previous: int) -> Tuple[int, bool]:
+    r = await get_client().get("https://apilist.tronscanapi.com/api/accountv2", params={"address": address})
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict):
+        dlist = data.get("data")
+        if isinstance(dlist, list) and dlist:
+            try:
+                return int((dlist[0] or {}).get("balance", 0) or 0), False
+            except Exception:
+                pass
+    return 0, False
+
+async def fetch_trx_raw_balance(address: str, previous: int) -> Tuple[int, bool]:
+    try:
+        return await _retry(_trx_trongrid, address, previous=previous)
+    except Exception:
+        return await _retry(_trx_tronscan, address, previous=previous)
+
+# --- ERC20 balances (USDT/USDC) ---
+
+def _erc20_balanceof_data(addr: str) -> str:
+    # 70a08231 + 12-byte pad + 20-byte address
+    return "0x70a08231" + ("0" * 24) + addr[2:].lower()
+
+async def _eth_rpc_call_balance(rpc_url: str, token: str, address: str, *, previous: int) -> Tuple[int, bool]:
+    data = _erc20_balanceof_data(address)
+    payload = {"jsonrpc": "2.0", "method": "eth_call", "params": [{"to": token, "data": data}, "latest"], "id": 1}
+    r = await get_client().post(rpc_url, json=payload)
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    out = (r.json() or {}).get("result")
+    if isinstance(out, str) and out.startswith("0x"):
+        return int(out, 16), False
+    return previous, False
+
+async def fetch_erc20_raw_balance(address: str, token_contract: str, previous: int) -> Tuple[int, bool]:
+    rate_limited = False
+    for rpc in ETH_RPCS:
+        try:
+            raw, rl = await _eth_rpc_call_balance(rpc, token_contract, address, previous=previous)
+            rate_limited = rate_limited or rl
+            if raw != previous or rl:
+                return raw, rate_limited
+        except Exception:
+            continue
+    return previous, rate_limited
+
+# --- TRC20 USDT ---
+
+async def _trc20_from_trongrid(address: str, contract: str, *, previous: int) -> Tuple[int, bool]:
+    r = await get_client().get(f"https://api.trongrid.io/v1/accounts/{address}")
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    data = r.json()
+    arr = data.get("data") or []
+    if not arr: return 0, False
+    trc20_list = arr[0].get("trc20") or []
+    for item in trc20_list:
+        if isinstance(item, dict) and contract in item:
+            try:
+                return int(item[contract]), False
+            except Exception:
+                pass
+    return 0, False
+
+async def _trc20_from_tronscan(address: str, contract: str, *, previous: int) -> Tuple[int, bool]:
+    r = await get_client().get("https://apilist.tronscanapi.com/api/accountv2", params={"address": address})
+    if r.status_code == 429: return previous, True
+    r.raise_for_status()
+    data = r.json()
+    balances = []
+    if isinstance(data, dict):
+        if "trc20token_balances" in data:
+            balances = data.get("trc20token_balances") or []
+        elif isinstance(data.get("data"), list) and data["data"]:
+            balances = (data["data"][0] or {}).get("trc20token_balances") or []
+    for it in balances:
+        if (it or {}).get("contract_address") == contract:
+            try:
+                return int(it.get("balance") or 0), False
+            except Exception:
+                pass
+    return 0, False
+
+async def fetch_trc20_raw_balance(address: str, token_contract: str, previous: int) -> Tuple[int, bool]:
+    try:
+        return await _retry(_trc20_from_trongrid, address, token_contract, previous=previous)
+    except Exception:
+        return await _retry(_trc20_from_tronscan, address, token_contract, previous=previous)
+
+# ---------- Chain selector ----------
+
+async def fetch_chain_raw_balance(chain: str, address: str, previous: int) -> Tuple[int, bool]:
+    c = normalize_chain(chain)
+    if c == "BTC":
+        return await fetch_btc_raw_balance(address, previous)
+    if c == "ETH":
+        return await fetch_eth_raw_balance(address, previous)
+    if c == "TRX":
+        return await fetch_trx_raw_balance(address, previous)
+    if c == "USDT_TRX":
+        return await fetch_trc20_raw_balance(address, TRC20_USDT, previous)
+    if c == "USDT_ETH":
+        return await fetch_erc20_raw_balance(address, ERC20_USDT, previous)
+    if c == "USDC_ETH":
+        return await fetch_erc20_raw_balance(address, ERC20_USDC, previous)
+    return previous, False
+
+# ---------- Storage ----------
+
+async def load_wallets() -> List[Dict]:
+    async with wallets_lock:
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+        out = []
+        for w in data if isinstance(data, list) else []:
+            if not isinstance(w, dict): continue
+            wid = int(w.get("id", 0) or 0)
+            chain = normalize_chain(w.get("chain", ""))
+            addr = str(w.get("address", "")).strip()
+            if not wid or chain not in CANONICAL_CHAINS or not addr:
+                continue
+            out.append({
+                "id": wid,
+                "chain": chain,
+                "address": addr,
+                "label": w.get("label", "") or "",
+                "notes": w.get("notes", "") or "",
+                "last_raw_balance": int(w.get("last_raw_balance", 0) or 0),
+            })
+        return out
+
+async def save_wallets(wallets: List[Dict]) -> None:
+    async with wallets_lock:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(wallets, f, ensure_ascii=False, indent=2)
+
+def next_wallet_id(wallets: List[Dict]) -> int:
+    return (max((w.get("id", 0) for w in wallets), default=0) or 0) + 1
+
+# ---------- Routes ----------
+
+@app.get("/")
+async def index():
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="index.html not found in /static")
+    return FileResponse(index_path)
+
+@app.get("/favicon.ico")
 async def favicon():
     return RedirectResponse(url="/static/favicon1.png")
 
-
-@app.get("/api/wallets", response_model=List[WalletWithBalances])
+@app.get("/api/wallets")
 async def get_wallets():
-    wallets = load_wallets()
-    async with httpx.AsyncClient() as client:
-        prices = await fetch_usd_prices(client)
-
-        # fetch tokens for each wallet
-        token_tasks = []
-        for w in wallets:
-            if w.chain == "ETH":
-                token_tasks.append(fetch_eth_tokens(client, w.address))
-            elif w.chain == "TRX":
-                token_tasks.append(fetch_trx_tokens(client, w.address))
-            else:
-                token_tasks.append(asyncio.sleep(0, result={}))
-        token_results = await asyncio.gather(*token_tasks)
-
-    wallets_with_balances = build_wallets_with_balances(wallets, prices, token_results)
+    wallets = await load_wallets()
+    prices = await fetch_usd_prices()
+    wallets_with_balances, _total = build_wallets_with_balances(wallets, prices)
     return wallets_with_balances
 
+@app.post("/api/wallets")
+async def create_wallet(payload: WalletCreate):
+    chain = normalize_chain(payload.chain)
+    if chain not in CANONICAL_CHAINS:
+        raise HTTPException(status_code=400, detail=f"Unsupported chain: {payload.chain}")
+    address = (payload.address or "").strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="Address is required")
+    validate_address(chain, address)
 
-@app.post("/api/wallets", response_model=Wallet)
-async def add_wallet(req: AddWalletRequest):
-    wallets = load_wallets()
-    new_id = (max((w.id for w in wallets), default=0) + 1) if wallets else 1
-    wallet = Wallet(
-        id=new_id,
-        chain=req.chain,
-        address=req.address.strip(),
-        label=(req.label or "").strip(),
-        notes=(req.notes or "").strip(),
-        last_raw_balance=0,
-    )
+    wallets = await load_wallets()
+    wid = next_wallet_id(wallets)
+    wallet = {
+        "id": wid,
+        "chain": chain,  # store canonical code
+        "address": address,
+        "label": (payload.label or "").strip(),
+        "notes": (payload.notes or "").strip(),
+        "last_raw_balance": 0,
+    }
     wallets.append(wallet)
-    save_wallets(wallets)
+    await save_wallets(wallets)
     return wallet
 
-
-@app.post("/api/wallets/bulk", response_model=List[Wallet])
-async def bulk_add_wallets(req: BulkImportRequest):
-    wallets = load_wallets()
-    next_id = max((w.id for w in wallets), default=0) + 1 if wallets else 1
-    lines = [line.strip() for line in req.lines.splitlines()]
-    created: List[Wallet] = []
-    for line in lines:
+@app.post("/api/wallets/bulk")
+async def bulk_create_wallets(payload: BulkImportRequest):
+    chain = normalize_chain(payload.chain)
+    if chain not in CANONICAL_CHAINS:
+        raise HTTPException(status_code=400, detail=f"Unsupported chain: {payload.chain}")
+    wallets = await load_wallets()
+    created = []
+    for line in (payload.lines or "").splitlines():
+        line = (line or "").strip()
         if not line:
             continue
         if "," in line:
             addr, label = line.split(",", 1)
-            addr = addr.strip()
-            label = label.strip()
+            addr, label = addr.strip(), label.strip()
         else:
-            addr = line.strip()
-            label = ""
-        if not addr:
+            addr, label = line, ""
+        try:
+            validate_address(chain, addr)
+        except HTTPException:
             continue
-        wallet = Wallet(
-            id=next_id,
-            chain=req.chain,
-            address=addr,
-            label=label,
-            notes="",
-            last_raw_balance=0,
-        )
-        wallets.append(wallet)
-        created.append(wallet)
-        next_id += 1
-    save_wallets(wallets)
+        wid = next_wallet_id(wallets)
+        wallet = {"id": wid, "chain": chain, "address": addr, "label": label, "notes": "", "last_raw_balance": 0}
+        wallets.append(wallet); created.append(wallet)
+    await save_wallets(wallets)
     return created
 
-
-@app.put("/api/wallets/{wallet_id}", response_model=Wallet)
-async def update_wallet(
-    wallet_id: int = FPath(..., ge=1), req: UpdateWalletRequest = None
-):
-    wallets = load_wallets()
-    target = None
+@app.put("/api/wallets/{wallet_id}")
+async def update_wallet(wallet_id: int, payload: WalletUpdate):
+    wallets = await load_wallets()
+    updated = None
     for w in wallets:
-        if w.id == wallet_id:
-            target = w
+        if w.get("id") == wallet_id:
+            if payload.label is not None: w["label"] = (payload.label or "").strip()
+            if payload.notes is not None: w["notes"] = (payload.notes or "").strip()
+            updated = w
             break
-    if not target:
+    if not updated:
         raise HTTPException(status_code=404, detail="Wallet not found")
-    data = target.dict()
-    if req.label is not None:
-        data["label"] = req.label
-    if req.notes is not None:
-        data["notes"] = req.notes
-    updated = Wallet(**data)
-    wallets = [updated if w.id == wallet_id else w for w in wallets]
-    save_wallets(wallets)
+    await save_wallets(wallets)
     return updated
 
-
 @app.delete("/api/wallets/{wallet_id}")
-async def delete_wallet(wallet_id: int = FPath(..., ge=1)):
-    wallets = load_wallets()
-    wallets = [w for w in wallets if w.id != wallet_id]
-    save_wallets(wallets)
+async def delete_wallet(wallet_id: int):
+    wallets = await load_wallets()
+    new_wallets = [w for w in wallets if w.get("id") != wallet_id]
+    if len(new_wallets) == len(wallets):
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    await save_wallets(new_wallets)
     return {"status": "ok"}
-
 
 @app.delete("/api/wallets")
 async def delete_all_wallets():
-    save_wallets([])
+    await save_wallets([])
     return {"status": "ok"}
 
+@app.post("/api/check")
+async def check_wallets():
+    wallets = await load_wallets()
+    chain_rate_limited: Dict[str, bool] = {c: False for c in CANONICAL_CHAINS}
 
-@app.post("/api/check", response_model=CheckResponse)
-async def check_balances():
-    wallets = load_wallets()
+    async def update_wallet_balance(w: Dict) -> Optional[int]:
+        old_raw = int(w.get("last_raw_balance", 0) or 0)
+        new_raw, rl = await fetch_chain_raw_balance(w["chain"], w["address"], old_raw)
+        if rl: chain_rate_limited[w["chain"]] = True
+        w["last_raw_balance"] = int(new_raw)
+        return w["id"] if new_raw > old_raw else None
 
-    async with httpx.AsyncClient() as client:
-        # native balances
-        native_tasks = [get_raw_balance_for_wallet(client, wallet) for wallet in wallets]
-        native_results = await asyncio.gather(*native_tasks)
+    deposits = await asyncio.gather(*(update_wallet_balance(w) for w in wallets))
+    deposits = [d for d in deposits if d is not None]
+    await save_wallets(wallets)
 
-        # token balances
-        token_tasks = []
-        for w in wallets:
-            if w.chain == "ETH":
-                token_tasks.append(fetch_eth_tokens(client, w.address))
-            elif w.chain == "TRX":
-                token_tasks.append(fetch_trx_tokens(client, w.address))
-            else:
-                token_tasks.append(asyncio.sleep(0, result={}))
-        token_results = await asyncio.gather(*token_tasks)
-
-        prices = await fetch_usd_prices(client)
-
-    if not wallets:
-        wallets_with_balances = build_wallets_with_balances(wallets, prices, [])
-        return CheckResponse(
-            wallets=wallets_with_balances,
-            total_usd=0.0,
-            usd_prices=prices,
-            deposits=[],
-            chain_status={
-                "BTC": {"status": "ok", "cooldown_remaining": 0},
-                "ETH": {"status": "ok", "cooldown_remaining": 0},
-                "TRX": {"status": "ok", "cooldown_remaining": 0},
-            },
-        )
-
-    deposits: List[int] = []
-    updated_wallets: List[Wallet] = []
-    for wallet, (new_raw, is_429) in zip(wallets, native_results):
-        old_raw = wallet.last_raw_balance
-        if new_raw > old_raw:
-            deposits.append(wallet.id)
-        updated_wallets.append(
-            Wallet(
-                **wallet.dict(exclude={"last_raw_balance"}),
-                last_raw_balance=int(new_raw),
-            )
-        )
-
-    save_wallets(updated_wallets)
-    wallets_with_balances = build_wallets_with_balances(
-        updated_wallets, prices, token_results
-    )
-    total_usd = compute_total_usd(wallets_with_balances)
+    prices = await fetch_usd_prices()
+    wallets_with_balances, total_usd = build_wallets_with_balances(wallets, prices)
 
     chain_status = {
-        "BTC": {"status": "ok", "cooldown_remaining": 0},
-        "ETH": {"status": "ok", "cooldown_remaining": 0},
-        "TRX": {"status": "ok", "cooldown_remaining": 0},
+        c: {
+            "status": "cooldown" if chain_rate_limited.get(c) else "ok",
+            "cooldown_remaining": 8 if chain_rate_limited.get(c) else 0,
+        } for c in CANONICAL_CHAINS
     }
 
-    return CheckResponse(
-        wallets=wallets_with_balances,
-        total_usd=total_usd,
-        usd_prices=prices,
-        deposits=deposits,
-        chain_status=chain_status,
-    )
+    return {
+        "wallets": wallets_with_balances,
+        "total_usd": total_usd,
+        "usd_prices": prices,
+        "deposits": deposits,
+        "chain_status": chain_status,
+    }
 
+def open_browser():
+    try:
+        webbrowser.open("http://localhost:8000")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "app:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=False,
-    )
+    timer = threading.Timer(1.0, open_browser)
+    timer.daemon = True
+    timer.start()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
