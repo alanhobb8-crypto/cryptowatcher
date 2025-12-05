@@ -1,334 +1,898 @@
-// /static/script.js  — FULL, FIXED
-"use strict";
+// static/script.js
+(() => {
+  const API_BASE = "";
 
-let wallets = [];
-let sortField = "usd_balance";
-let sortDirection = "desc";
-let autoCheckIntervalId = null;
-let audioCtx = null;
+  let wallets = [];
+  let selectedWalletId = null;
+  let autoCheckTimer = null;
 
-const ASSETS = ["BTC","ETH","TRX","USDT_TRX","USDT_ETH","USDC_ETH","USDC"]; // include alias
-const chainChipMode = Object.fromEntries(ASSETS.map(c=>[c,"usd"]));
+  let sortField = "usd";
+  let sortDirection = "desc"; // "asc" | "desc"
 
-function $(id){ return document.getElementById(id); }
-const qs = (sel,root=document)=>root.querySelector(sel);
-const qsa = (sel,root=document)=>[...root.querySelectorAll(sel)];
+  let filterSearch = "";
+  let filterMinUsd = null;
+  let filterMaxUsd = null;
 
-function formatUsd(v){ const n=Number(v)||0; return n>=1000? n.toLocaleString(undefined,{style:"currency",currency:"USD",maximumFractionDigits:2,minimumFractionDigits:2}) : "$"+n.toFixed(2); }
-function formatCoin(c,v){ const n=Number(v)||0; return (c.startsWith?.("USDT")||c.startsWith?.("USDC")||c==="TRX") ? n.toFixed(2) : n.toFixed(8); }
-function shortAddress(a){ return !a||a.length<=12 ? (a||"") : a.slice(0,6)+"…"+a.slice(-4); }
+  const chainDisplayMode = {
+    BTC: "usd",
+    ETH: "usd",
+    TRX: "usd",
+  };
 
-function canonical(chain){
-  const c=(chain||"").toUpperCase();
-  if(c==="USDC") return "USDC_ETH";
-  if(c==="USDT") return "USDT_ETH";
-  return c;
-}
+  const depositAudio = new Audio("/static/cashier.mp3");
+  depositAudio.volume = 0.85;
 
-function explorerUrl(chain, address){
-  const c=canonical(chain);
-  if (c==="BTC") return `https://blockstream.info/address/${address}`;
-  if (c==="ETH" || c==="USDT_ETH" || c==="USDC_ETH") return `https://etherscan.io/address/${address}`;
-  if (c==="TRX" || c==="USDT_TRX") return `https://tronscan.org/#/address/${address}`;
-  return "#";
-}
+  // DOM refs
+  const totalPortfolioEl = document.getElementById("total-portfolio-usd");
+  const chainChipsEl = document.getElementById("chain-chips");
+  const walletCountEl = document.getElementById("wallet-count");
+  const walletTbodyEl = document.getElementById("wallet-tbody");
+  const emptyStateEl = document.getElementById("empty-state");
 
-/* Clipboard */
-async function copyText(text){
-  try{
-    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; }
-  }catch{}
-  try{
-    const ta=document.createElement("textarea"); ta.value=text; ta.style.position="fixed"; ta.style.left="-9999px";
-    document.body.appendChild(ta); ta.focus(); ta.select();
-    const ok=document.execCommand("copy"); document.body.removeChild(ta); return ok;
-  }catch{ return false; }
-}
+  const addChainEl = document.getElementById("add-chain");
+  const addAddressEl = document.getElementById("add-address");
+  const addLabelEl = document.getElementById("add-label");
+  const addNotesEl = document.getElementById("add-notes");
+  const addWalletBtn = document.getElementById("add-wallet-btn");
 
-function ensureAudioContext(){ if(!audioCtx){ try{ audioCtx=new (window.AudioContext||window.webkitAudioContext)(); }catch{ audioCtx=null; } } }
-function beep(f,ms){ ensureAudioContext(); if(!audioCtx) return; const o=audioCtx.createOscillator(), g=audioCtx.createGain(); o.type="sine"; o.frequency.value=f; g.gain.setValueAtTime(0.001,audioCtx.currentTime); g.gain.exponentialRampToValueAtTime(0.2,audioCtx.currentTime+.01); g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+ms/1000); o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+ms/1000+.02); }
+  const bulkChainEl = document.getElementById("bulk-chain");
+  const bulkLinesEl = document.getElementById("bulk-lines");
+  const bulkImportBtn = document.getElementById("bulk-import-btn");
+  const deleteAllBtn = document.getElementById("delete-all-btn");
 
-function notifyDeposit(w, amt){
-  if(!("Notification" in window)) return;
-  if(Notification.permission==="default"){ Notification.requestPermission(); return; }
-  if(Notification.permission!=="granted") return;
-  const body=`${formatCoin(w.chain,amt)} received · ${shortAddress(w.address)}`;
-  try{ new Notification("Deposit detected",{ body, icon:"/static/favicon1.png" }); }catch{}
-}
+  const autoToggleEl = document.getElementById("auto-toggle");
+  const autoIntervalEl = document.getElementById("auto-interval");
+  const checkNowBtn = document.getElementById("check-now-btn");
 
-function setChainStatus(status){
-  qsa(".chip").forEach(chip=>{
-    const chain=chip.dataset.chain;
-    const el=qs(".chip-status", chip);
-    const st=(status&&status[canonical(chain)])||{status:"ok",cooldown_remaining:0};
-    el.textContent = st.status==="cooldown" ? `COOLDOWN ${st.cooldown_remaining}s` : "OK";
-  });
-}
+  const filterSearchEl = document.getElementById("filter-search");
+  const filterMinUsdEl = document.getElementById("filter-min-usd");
+  const filterMaxUsdEl = document.getElementById("filter-max-usd");
+  const sortFieldEl = document.getElementById("sort-field");
+  const sortDirectionBtn = document.getElementById("sort-direction-btn");
+  const sortDirectionIcon = document.getElementById("sort-direction-icon");
 
-function addNotif({type,title,body,meta}){
-  const c=$("notifications-container"); if(!c) return;
-  const card=document.createElement("div"); card.className="notification-card "+(type||"");
-  const t=document.createElement("div"); t.className="notif-title"; t.textContent=title||"";
-  const b=document.createElement("div"); b.textContent=body||"";
-  const m=document.createElement("div"); m.className="notif-meta"; m.textContent=meta||"";
-  card.append(t,b,m); c.append(card);
-  const timer=setTimeout(()=>card.remove(),8000);
-  card.addEventListener("click",()=>{ clearTimeout(timer); card.remove(); });
-}
+  const toastContainer = document.getElementById("toast-container");
 
-function totals(){
-  const keys=["BTC","ETH","TRX","USDT_TRX","USDT_ETH","USDC_ETH"];
-  const t={overallUsd:0, per:Object.fromEntries(keys.map(k=>[k,{coin:0,usd:0}]))};
-  for(const w of wallets){
-    const c=canonical(w.chain);
-    const usd=+w.usd_balance||0, coin=+w.coin_balance||0;
-    t.overallUsd+=usd;
-    if(t.per[c]){ t.per[c].usd+=usd; t.per[c].coin+=coin; }
-  }
-  return t;
-}
+  const editModalEl = document.getElementById("edit-modal");
+  const editModalClose = document.getElementById("edit-modal-close");
+  const editModalSave = document.getElementById("edit-modal-save");
+  const editModalCancel = document.getElementById("edit-modal-cancel");
+  const editLabelEl = document.getElementById("edit-label");
+  const editNotesEl = document.getElementById("edit-notes");
 
-function renderHeader(){
-  const t=totals();
-  $("total-portfolio-usd").textContent = formatUsd(t.overallUsd);
-  qsa(".chip").forEach(chip=>{
-    const chain=chip.dataset.chain; const c=canonical(chain);
-    const mode=chainChipMode[chain]||"usd";
-    const v=qs(`.chip-value[data-chain="${chain}"]`, chip);
-    const agg=t.per[c] || {coin:0, usd:0};
-    v.textContent = mode==="coin" ? formatCoin(c, agg.coin) : formatUsd(agg.usd);
-    chip.setAttribute("aria-pressed", String(mode==="coin"));
-  });
-}
+  let editWalletId = null;
 
-function filterList(){
-  const q=($("filter-search")?.value||"").trim().toLowerCase();
-  const min=parseFloat($("filter-min-usd")?.value), max=parseFloat($("filter-max-usd")?.value);
-  return wallets.filter(w=>{
-    const usd=+w.usd_balance||0;
-    if(!Number.isNaN(min) && usd<min) return false;
-    if(!Number.isNaN(max) && usd>max) return false;
-    if(q){
-      const l=(w.label||"").toLowerCase(), a=(w.address||"").toLowerCase();
-      if(!l.includes(q) && !a.includes(q)) return false;
-    }
-    return true;
-  });
-}
-
-function sortList(list){
-  const dir=sortDirection==="asc"?1:-1, f=sortField;
-  return [...list].sort((a,b)=>{
-    let va=a[f], vb=b[f];
-    if(f==="usd_balance"||f==="coin_balance"){ va=+va||0; vb=+vb||0; return (va-vb)*dir; }
-    const sa=String(va||"").toLowerCase(), sb=String(vb||"").toLowerCase();
-    return sa<sb? -1*dir : sa>sb? 1*dir : 0;
-  });
-}
-
-function chainClass(chain){
-  const c=canonical(chain);
-  if (c==="BTC") return "btc";
-  if (c==="ETH") return "eth";
-  if (c==="TRX") return "trx";
-  if (c==="USDT_TRX" || c==="USDT_ETH") return "usdt";
-  if (c==="USDC_ETH") return "usdc";
-  return "eth";
-}
-
-function getDotColor(cls){
-  const css = getComputedStyle(document.documentElement);
-  if (cls==="btc") return css.getPropertyValue("--btc").trim();
-  if (cls==="eth") return css.getPropertyValue("--eth").trim();
-  if (cls==="trx") return css.getPropertyValue("--trx").trim();
-  if (cls==="usdt") return css.getPropertyValue("--usdt").trim();
-  if (cls==="usdc") return css.getPropertyValue("--usdc").trim();
-  return "#999";
-}
-
-function renderCards(list){
-  const wrap=$("wallet-cards"); const count=$("wallet-count");
-  wrap.innerHTML=""; count.textContent=`${wallets.length} wallet${wallets.length===1?"":"s"}`;
-
-  for(const w of list){
-    const cls = chainClass(w.chain);
-    const card=document.createElement("div");
-    card.className=`card card-${cls}`;
-    card.dataset.id=String(w.id);
-
-    const accent=document.createElement("div"); accent.className="card-accent"; card.append(accent);
-
-    const head=document.createElement("div"); head.className="card-head";
-    const badge=document.createElement("div"); badge.className="badge";
-    const dot=document.createElement("span"); dot.className="dot"; dot.style.background = getDotColor(cls);
-    const sym=document.createElement("span"); sym.textContent=canonical(w.chain).replace("_","-");
-    badge.append(dot,sym);
-    const label=document.createElement("div"); label.textContent=w.label || "—"; label.style.marginLeft="auto";
-    head.append(badge,label);
-
-    const addr=document.createElement("div"); addr.className="addr"; addr.textContent=shortAddress(w.address); addr.title=w.address;
-
-    const row1=document.createElement("div"); row1.className="kv";
-    row1.innerHTML = `<div class="label">Balance</div><div class="value">${formatCoin(canonical(w.chain),w.coin_balance)}</div>`;
-
-    const row2=document.createElement("div"); row2.className="kv";
-    row2.innerHTML = `<div class="label">USD</div><div class="value">${formatUsd(w.usd_balance)}</div>`;
-
-    const actions=document.createElement("div"); actions.className="actions";
-    const left=document.createElement("div"); left.className="actions-left";
-    const right=document.createElement("div"); right.className="actions-right";
-
-    const copy=document.createElement("button");
-    copy.className="btn small icon copy-btn";
-    copy.innerHTML = `<span class="i">⎘</span><span class="t">Copy</span>`;
-    copy.title = "Copy address"; copy.ariaLabel = "Copy address";
-
-    const explorer=document.createElement("button");
-    explorer.className="btn small icon explorer-btn";
-    explorer.innerHTML = `<span class="i">↗</span><span class="t">Explorer</span>`;
-    explorer.title = "Open in explorer"; explorer.ariaLabel = "Open in explorer";
-
-    const edit=document.createElement("button");
-    edit.className="btn small icon edit-btn";
-    edit.innerHTML = `<span class="i">✎</span><span class="t">Edit</span>`;
-
-    const del=document.createElement("button");
-    del.className="btn small icon danger delete-btn";
-    del.innerHTML = `<span class="i">␡</span><span class="t">Delete</span>`;
-
-    left.append(copy, explorer); right.append(edit, del);
-    actions.append(left, right);
-
-    card.append(head,addr,row1,row2,actions);
-    wrap.append(card);
-  }
-}
-
-function renderAll(){ renderHeader(); renderCards(sortList(filterList())); }
-
-/* API */
-async function loadWallets(){
-  try{
-    const r=await fetch("/api/wallets"); const d=await r.json();
-    wallets = Array.isArray(d)? d : Array.isArray(d.wallets)? d.wallets : [];
-  }catch{ wallets=[]; }
-  renderAll();
-}
-
-async function addWallet(){
-  // FIX: the old code used `and` (Python) instead of `&&` (JS) → broke the whole app
-  const chain=qs("#add-chain").value, address=qs("#add-address").value.trim(), label=qs("#add-label").value.trim(), notes=qs("#add-notes").value.trim();
-  if(!address){ alert("Address is required."); return; }
-  try{
-    const r=await fetch("/api/wallets",{ method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ chain, address, label, notes }) });
-    if(!r.ok){ const msg=(await r.json())?.detail || "Failed to add wallet"; alert(msg); return; }
-    // success path
-    await r.json(); // no-op; ensure body consumed in dev tools
-    ["#add-address","#add-label","#add-notes"].forEach(s=>qs(s).value="");
-    await loadWallets();
-  }catch(e){
-    console.error(e);
-  }
-}
-
-async function bulkImport(){
-  const chain=qs("#bulk-chain").value, lines=qs("#bulk-lines").value;
-  if(!lines.trim()){ alert("Paste at least one line."); return; }
-  try{ await fetch("/api/wallets/bulk",{ method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ chain,lines }) }); qs("#bulk-lines").value=""; await loadWallets(); }catch{}
-}
-async function deleteAllWallets(){ if(!confirm("Delete ALL wallets?")) return; try{ await fetch("/api/wallets",{ method:"DELETE" }); wallets=[]; renderAll(); }catch{} }
-async function deleteWallet(id){ if(!confirm("Delete this wallet?")) return; try{ await fetch(`/api/wallets/${id}`,{ method:"DELETE" }); wallets=wallets.filter(x=>x.id!==id); renderAll(); }catch{} }
-
-/* Modal */
-let editingId=null;
-function openModal(w){ editingId=w.id; $("edit-label").value=w.label||""; $("edit-notes").value=w.notes||""; $("edit-modal-backdrop").classList.remove("hidden"); $("edit-label").focus(); }
-function closeModal(){ editingId=null; $("edit-modal-backdrop").classList.add("hidden"); }
-async function saveModal(){
-  if(editingId==null) return;
-  const label=$("edit-label").value, notes=$("edit-notes").value;
-  try{
-    const r=await fetch(`/api/wallets/${editingId}`,{ method:"PUT", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ label,notes }) });
-    const u=await r.json(); wallets=wallets.map(w=>w.id===u.id?{...w,...u}:w); renderAll();
-  }catch{} closeModal();
-}
-
-/* Check */
-async function runCheck(manual){
-  const prev=new Map(wallets.map(w=>[w.id,{ raw:+(w.raw_balance||w.last_raw_balance||0)||0, usd:+w.usd_balance||0, coin:+w.coin_balance||0 }]));
-  try{
-    const r=await fetch("/api/check",{ method:"POST" }); const d=await r.json();
-    if(Array.isArray(d.wallets)) wallets=d.wallets; else if(Array.isArray(d)) wallets=d;
-    renderAll(); setChainStatus(d.chain_status);
-
-    const deposits=Array.isArray(d.deposits)? d.deposits : [];
-    let changed=0;
-    for(const w of wallets){ const p=prev.get(w.id)||{raw:0,usd:0}; const cr=+(w.raw_balance||w.last_raw_balance||0)||0; const cu=+w.usd_balance||0; if(cr!==p.raw||cu!==p.usd) changed++; }
-    for(const id of deposits){
-      const w=wallets.find(x=>x.id===id); if(!w) continue;
-      const p=prev.get(id)||{ coin:0, usd:0 };
-      const dCoin=(+w.coin_balance||0) - (+p.coin||0) || (+w.coin_balance||0);
-      const dUsd=(+w.usd_balance||0) - (+p.usd||0) || (+w.usd_balance||0);
-      const card=qs(`.card[data-id="${id}"]`); if(card){ card.classList.add("deposit"); setTimeout(()=>card.classList.remove("deposit"), 900); }
-      beep(880,140); notifyDeposit(w, dCoin);
-      addNotif({ type:"deposit", title:"Deposit detected", body:w.label||shortAddress(w.address), meta:`${formatCoin(canonical(w.chain),dCoin)} · ${formatUsd(dUsd)}` });
-    }
-    if(changed>0 || manual){
-      const t=totals(); addNotif({ type:"updated", title:"Balances updated", body: changed>0? `${changed} wallet${changed===1?"":"s"} changed` : `${wallets.length} checked`, meta:`Portfolio ${formatUsd(t.overallUsd)}` });
-      beep(520,110);
-    }
-  }catch(e){
-    console.error(e);
-  }
-}
-
-/* Auto-check */
-function enableAuto(){
-  const inp=$("auto-check-interval"); let s=parseInt(inp.value,10); if(Number.isNaN(s)) s=60; s=Math.min(3600,Math.max(15,s)); inp.value=String(s);
-  localStorage.setItem("cw:autoCheck","1"); localStorage.setItem("cw:autoCheckInterval",String(s));
-  if(autoCheckIntervalId) clearInterval(autoCheckIntervalId);
-  autoCheckIntervalId=setInterval(()=>runCheck(false), s*1000);
-}
-function disableAuto(){ if(autoCheckIntervalId){ clearInterval(autoCheckIntervalId); autoCheckIntervalId=null; } localStorage.setItem("cw:autoCheck","0"); }
-
-/* Events */
-function wire(){
-  qs("#check-now-btn")?.addEventListener("click",(e)=>{ e.preventDefault(); runCheck(true); });
-  qs("#add-wallet-btn")?.addEventListener("click",(e)=>{ e.preventDefault(); addWallet(); });
-  qs("#bulk-import-btn")?.addEventListener("click",(e)=>{ e.preventDefault(); bulkImport(); });
-  qs("#delete-all-btn")?.addEventListener("click",(e)=>{ e.preventDefault(); deleteAllWallets(); });
-
-  qsa(".chip").forEach(chip=>{
-    chip.addEventListener("click",()=>{
-      const chain=chip.dataset.chain; const cur=chainChipMode[chain]||"usd"; chainChipMode[chain] = cur==="usd" ? "coin" : "usd"; renderHeader();
+  // Utils
+  function formatUSD(v) {
+    const num = Number(v) || 0;
+    return num.toLocaleString(undefined, {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: 2,
     });
-  });
+  }
 
-  ["filter-search","filter-min-usd","filter-max-usd"].forEach(id=>$(id)?.addEventListener("input",()=>renderAll()));
+  function formatCoin(chainOrSymbol, v) {
+    const num = Number(v) || 0;
+    let maxFraction = 8;
+    if (chainOrSymbol === "TRX" || chainOrSymbol === "USDT" || chainOrSymbol === "USDC") {
+      maxFraction = 6;
+    }
+    return num.toLocaleString(undefined, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: maxFraction,
+    });
+  }
 
-  $("auto-check-toggle")?.addEventListener("change",(e)=>{ e.target.checked? enableAuto() : disableAuto(); });
-  $("edit-cancel-btn")?.addEventListener("click",(e)=>{ e.preventDefault(); closeModal(); });
-  $("edit-save-btn")?.addEventListener("click",(e)=>{ e.preventDefault(); saveModal(); });
-  $("edit-modal-backdrop")?.addEventListener("click",(e)=>{ if(e.target.id==="edit-modal-backdrop") closeModal(); });
+  function shortAddress(addr) {
+    if (!addr) return "";
+    if (addr.length <= 16) return addr;
+    return addr.slice(0, 6) + "…" + addr.slice(-6);
+  }
 
-  $("wallet-cards")?.addEventListener("click", async (e)=>{
-    const card=e.target.closest(".card"); if(!card) return;
-    const id=parseInt(card.dataset.id,10); if(Number.isNaN(id)) return;
-    const w = wallets.find(x=>x.id===id); if(!w) return;
-    const btn=e.target.closest("button"); if(!btn) return;
+  function clampInterval(seconds) {
+    let s = Number(seconds) || 60;
+    if (s < 15) s = 15;
+    if (s > 3600) s = 3600;
+    return s;
+  }
 
-    if(btn.classList.contains("copy-btn")){
-      const ok = await copyText(w.address);
-      addNotif({ type: ok ? "updated" : "error", title: ok ? "Copied!" : "Copy failed", body: shortAddress(w.address), meta: canonical(w.chain) });
-      if (ok) beep(700,90);
+  function walletTotalUsd(w) {
+    const native = Number(w.usd_balance || 0);
+    const tokens = (w.tokens || []).reduce(
+      (sum, t) => sum + Number(t.usd_balance || 0),
+      0
+    );
+    return native + tokens;
+  }
+
+  // Toast / notifications
+  function pushToast({ type, title, body, meta, onClick, timeout = 8000 }) {
+    const toast = document.createElement("div");
+    toast.className = "toast" + (type === "deposit" ? " toast-deposit" : "");
+    const icon = document.createElement("div");
+    icon.className = "toast-icon";
+    icon.textContent = type === "deposit" ? "💸" : "🔄";
+    const content = document.createElement("div");
+    content.className = "toast-content";
+
+    const titleEl = document.createElement("div");
+    titleEl.className = "toast-title";
+    titleEl.textContent = title;
+
+    const bodyEl = document.createElement("div");
+    bodyEl.className = "toast-body";
+    bodyEl.textContent = body;
+
+    const metaEl = document.createElement("div");
+    metaEl.className = "toast-meta";
+    metaEl.textContent = meta || "";
+
+    content.appendChild(titleEl);
+    content.appendChild(bodyEl);
+    if (meta) content.appendChild(metaEl);
+
+    toast.appendChild(icon);
+    toast.appendChild(content);
+
+    let timeoutId = null;
+
+    function removeToast() {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+
+    toast.addEventListener("click", () => {
+      if (onClick) onClick();
+      removeToast();
+    });
+
+    toastContainer.appendChild(toast);
+
+    if (timeout > 0) {
+      timeoutId = setTimeout(removeToast, timeout);
+    }
+  }
+
+  function ensureNotificationPermission() {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }
+
+  function showDesktopDepositNotification({ title, body }) {
+    if (!("Notification" in window)) return;
+    if (Notification.permission !== "granted") return;
+    try {
+      new Notification(title, {
+        body,
+        icon: "/static/favicon1.png",
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  // Totals & header
+  function computeTotals() {
+    const totals = {
+      overallUsd: 0,
+      perChain: {
+        BTC: { coin: 0, usd: 0 },
+        ETH: { coin: 0, usd: 0 },
+        TRX: { coin: 0, usd: 0 },
+      },
+    };
+    for (const w of wallets) {
+      const chain = w.chain;
+      const nativeCoin = Number(w.coin_balance || 0);
+      const nativeUsd = Number(w.usd_balance || 0);
+      const tokenUsd = (w.tokens || []).reduce(
+        (sum, t) => sum + Number(t.usd_balance || 0),
+        0
+      );
+      const totalUsd = nativeUsd + tokenUsd;
+
+      totals.overallUsd += totalUsd;
+
+      if (totals.perChain[chain]) {
+        totals.perChain[chain].coin += nativeCoin;
+        totals.perChain[chain].usd += totalUsd;
+      }
+    }
+    return totals;
+  }
+
+  function renderHeader() {
+    const totals = computeTotals();
+    totalPortfolioEl.textContent = formatUSD(totals.overallUsd);
+
+    chainChipsEl.innerHTML = "";
+    const chains = ["BTC", "ETH", "TRX"];
+    chains.forEach((chain) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chain-chip";
+      const dot = document.createElement("span");
+      dot.className = "chain-dot chain-dot-" + chain.toLowerCase();
+
+      const main = document.createElement("div");
+      main.className = "chain-chip-main";
+      const label = document.createElement("div");
+      label.className = "chain-chip-label";
+      label.textContent = chain + ": OK";
+
+      const value = document.createElement("div");
+      value.className = "chain-chip-value";
+      const mode = chainDisplayMode[chain] || "usd";
+
+      if (mode === "coin") {
+        value.textContent = formatCoin(chain, totals.perChain[chain].coin);
+      } else {
+        value.textContent = formatUSD(totals.perChain[chain].usd);
+      }
+      const modeSpan = document.createElement("span");
+      modeSpan.className = "chain-chip-mode";
+      modeSpan.textContent = mode === "coin" ? "coin" : "USD";
+      value.appendChild(modeSpan);
+
+      main.appendChild(label);
+      main.appendChild(value);
+
+      chip.appendChild(dot);
+      chip.appendChild(main);
+
+      chip.addEventListener("click", () => {
+        chainDisplayMode[chain] = mode === "coin" ? "usd" : "coin";
+        renderHeader();
+      });
+
+      chainChipsEl.appendChild(chip);
+    });
+  }
+
+  // Filtering & sorting
+  function currentFilteredSortedWallets() {
+    let filtered = wallets.slice();
+
+    if (filterSearch) {
+      const q = filterSearch.toLowerCase();
+      filtered = filtered.filter(
+        (w) =>
+          (w.label || "").toLowerCase().includes(q) ||
+          (w.address || "").toLowerCase().includes(q)
+      );
+    }
+
+    if (filterMinUsd != null) {
+      filtered = filtered.filter((w) => walletTotalUsd(w) >= filterMinUsd);
+    }
+    if (filterMaxUsd != null) {
+      filtered = filtered.filter((w) => walletTotalUsd(w) <= filterMaxUsd);
+    }
+
+    filtered.sort((a, b) => {
+      let av, bv;
+      switch (sortField) {
+        case "usd":
+          av = walletTotalUsd(a);
+          bv = walletTotalUsd(b);
+          break;
+        case "balance":
+          av = Number(a.coin_balance || 0);
+          bv = Number(b.coin_balance || 0);
+          break;
+        case "chain":
+          av = a.chain;
+          bv = b.chain;
+          break;
+        case "label":
+          av = (a.label || "").toLowerCase();
+          bv = (b.label || "").toLowerCase();
+          break;
+        case "address":
+          av = (a.address || "").toLowerCase();
+          bv = (b.address || "").toLowerCase();
+          break;
+        default:
+          av = walletTotalUsd(a);
+          bv = walletTotalUsd(b);
+      }
+
+      if (av < bv) return sortDirection === "asc" ? -1 : 1;
+      if (av > bv) return sortDirection === "asc" ? 1 : -1;
+      return 0;
+    });
+
+    return filtered;
+  }
+
+  // Rendering
+  function renderWalletTable({ depositIds = [] } = {}) {
+    const filtered = currentFilteredSortedWallets();
+    walletTbodyEl.innerHTML = "";
+
+    walletCountEl.textContent =
+      filtered.length + (filtered.length === 1 ? " wallet" : " wallets");
+
+    if (filtered.length === 0) {
+      emptyStateEl.style.display = "block";
+    } else {
+      emptyStateEl.style.display = "none";
+    }
+
+    filtered.forEach((w) => {
+      const tr = document.createElement("tr");
+      tr.dataset.walletRowId = String(w.id);
+      tr.classList.add("wallet-row-" + w.chain.toLowerCase());
+      if (depositIds.includes(w.id)) {
+        tr.classList.add("deposit-pulse");
+      }
+      if (selectedWalletId === w.id) {
+        tr.classList.add("selected-row");
+      }
+
+      // Chain
+      const tdChain = document.createElement("td");
+      const badge = document.createElement("span");
+      badge.className = "chain-badge";
+      const dot = document.createElement("span");
+      dot.className =
+        "dot dot-" + w.chain.toLowerCase();
+      const txt = document.createElement("span");
+      txt.textContent = w.chain;
+      badge.appendChild(dot);
+      badge.appendChild(txt);
+      tdChain.appendChild(badge);
+
+      // Label + tokens
+      const tdLabel = document.createElement("td");
+      const labelEl = document.createElement("span");
+      labelEl.className = "wallet-label";
+      labelEl.textContent = w.label || "(no label)";
+      tdLabel.appendChild(labelEl);
+
+      if (w.tokens && w.tokens.length > 0) {
+        const tokenStrip = document.createElement("div");
+        tokenStrip.className = "token-strip";
+        w.tokens.forEach((t) => {
+          const pill = document.createElement("span");
+          pill.className = "token-pill";
+          const coinStr = formatCoin(t.symbol, t.coin_balance);
+          const usdStr = formatUSD(t.usd_balance);
+          pill.textContent = `${t.symbol} (${t.standard}) · ${coinStr} · ${usdStr}`;
+          tokenStrip.appendChild(pill);
+        });
+        tdLabel.appendChild(tokenStrip);
+      }
+
+      // Address
+      const tdAddr = document.createElement("td");
+      const addrEl = document.createElement("span");
+      addrEl.className = "wallet-address";
+      addrEl.textContent = shortAddress(w.address);
+      tdAddr.appendChild(addrEl);
+
+      // Native balance
+      const tdBalance = document.createElement("td");
+      tdBalance.className = "numeric";
+      tdBalance.textContent = formatCoin(w.chain, w.coin_balance);
+
+      // USD (native + tokens)
+      const tdUsd = document.createElement("td");
+      tdUsd.className = "numeric";
+      tdUsd.textContent = formatUSD(walletTotalUsd(w));
+
+      // Actions
+      const tdActions = document.createElement("td");
+      tdActions.className = "actions-cell";
+
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "icon-btn";
+      editBtn.textContent = "Edit";
+      editBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openEditModal(w);
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "icon-btn danger";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteWallet(w.id);
+      });
+
+      tdActions.appendChild(editBtn);
+      tdActions.appendChild(delBtn);
+
+      tr.appendChild(tdChain);
+      tr.appendChild(tdLabel);
+      tr.appendChild(tdAddr);
+      tr.appendChild(tdBalance);
+      tr.appendChild(tdUsd);
+      tr.appendChild(tdActions);
+
+      tr.addEventListener("click", () => {
+        selectedWalletId = w.id;
+        renderWalletTable();
+      });
+
+      tr.addEventListener("dblclick", () => {
+        if (!w.notes) return;
+        pushToast({
+          type: "info",
+          title: w.label || shortAddress(w.address),
+          body: w.notes,
+          meta: "Notes",
+          timeout: 12000,
+        });
+      });
+
+      walletTbodyEl.appendChild(tr);
+    });
+  }
+
+  function renderAll(options = {}) {
+    renderHeader();
+    renderWalletTable(options);
+  }
+
+  // API helpers
+  async function apiGet(path) {
+    const res = await fetch(API_BASE + path);
+    if (!res.ok) {
+      throw new Error("HTTP " + res.status);
+    }
+    return res.json();
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : null,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error("HTTP " + res.status + ": " + text);
+    }
+    return res.json();
+  }
+
+  async function apiPut(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error("HTTP " + res.status + ": " + text);
+    }
+    return res.json();
+  }
+
+  async function apiDelete(path) {
+    const res = await fetch(API_BASE + path, { method: "DELETE" });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error("HTTP " + res.status + ": " + text);
+    }
+    return res.json();
+  }
+
+  // Load wallets
+  async function loadWallets() {
+    try {
+      const data = await apiGet("/api/wallets");
+      wallets = data || [];
+      renderAll();
+    } catch (err) {
+      console.error("Failed to load wallets", err);
+      pushToast({
+        type: "info",
+        title: "Error loading wallets",
+        body: "Check the backend logs for details.",
+        meta: "",
+        timeout: 8000,
+      });
+    }
+  }
+
+  // Add wallet
+  async function addWallet() {
+    const chain = addChainEl.value;
+    const address = addAddressEl.value.trim();
+    const label = addLabelEl.value.trim();
+    const notes = addNotesEl.value.trim();
+
+    if (!address) {
+      addAddressEl.focus();
       return;
     }
-    if(btn.classList.contains("explorer-btn")){ window.open(explorerUrl(w.chain,w.address), "_blank", "noopener"); return; }
-    if(btn.classList.contains("edit-btn")){ openModal(w); return; }
-    if(btn.classList.contains("delete-btn")){ deleteWallet(id); return; }
-  });
 
-  const saved=localStorage.getItem("cw:autoCheck"); const savedInt=parseInt(localStorage.getItem("cw:autoCheckInterval")||"60",10);
-  if(saved==="1"){ $("auto-check-toggle").checked=true; $("auto-check-interval").value=String(Math.min(3600,Math.max(15,savedInt||60))); enableAuto(); }
-}
+    try {
+      const created = await apiPost("/api/wallets", {
+        chain,
+        address,
+        label,
+        notes,
+      });
+      wallets.push({
+        ...created,
+        raw_balance: created.last_raw_balance || 0,
+        coin_balance: 0,
+        usd_balance: 0,
+        tokens: [],
+      });
+      addAddressEl.value = "";
+      addLabelEl.value = "";
+      addNotesEl.value = "";
+      renderAll();
+    } catch (err) {
+      console.error("Add wallet failed", err);
+      pushToast({
+        type: "info",
+        title: "Failed to add wallet",
+        body: "Make sure the chain and address are valid.",
+        meta: "",
+      });
+    }
+  }
 
-document.addEventListener("DOMContentLoaded",()=>{ wire(); loadWallets(); });
+  // Bulk import
+  async function bulkImport() {
+    const chain = bulkChainEl.value;
+    const lines = bulkLinesEl.value.trim();
+    if (!lines) {
+      bulkLinesEl.focus();
+      return;
+    }
+    try {
+      const created = await apiPost("/api/wallets/bulk", { chain, lines });
+      created.forEach((w) => {
+        wallets.push({
+          ...w,
+          raw_balance: w.last_raw_balance || 0,
+          coin_balance: 0,
+          usd_balance: 0,
+          tokens: [],
+        });
+      });
+      bulkLinesEl.value = "";
+      renderAll();
+    } catch (err) {
+      console.error("Bulk import failed", err);
+      pushToast({
+        type: "info",
+        title: "Bulk import failed",
+        body: "Check your input format.",
+        meta: "",
+      });
+    }
+  }
+
+  // Delete wallet
+  async function deleteWallet(id) {
+    if (!confirm("Delete this wallet from your local list?")) return;
+    try {
+      await apiDelete(`/api/wallets/${id}`);
+      wallets = wallets.filter((w) => w.id !== id);
+      if (selectedWalletId === id) {
+        selectedWalletId = null;
+      }
+      renderAll();
+    } catch (err) {
+      console.error("Delete wallet failed", err);
+      pushToast({
+        type: "info",
+        title: "Failed to delete wallet",
+        body: "Check backend logs.",
+        meta: "",
+      });
+    }
+  }
+
+  // Delete all
+  async function deleteAllWallets() {
+    if (!confirm("Delete ALL wallets from your local list?")) return;
+    try {
+      await apiDelete("/api/wallets");
+      wallets = [];
+      selectedWalletId = null;
+      renderAll();
+    } catch (err) {
+      console.error("Delete all failed", err);
+      pushToast({
+        type: "info",
+        title: "Failed to delete all wallets",
+        body: "Check backend logs.",
+        meta: "",
+      });
+    }
+  }
+
+  // Edit modal
+  function openEditModal(wallet) {
+    editWalletId = wallet.id;
+    editLabelEl.value = wallet.label || "";
+    editNotesEl.value = wallet.notes || "";
+    editModalEl.classList.remove("hidden");
+    editLabelEl.focus();
+  }
+
+  function closeEditModal() {
+    editWalletId = null;
+    editModalEl.classList.add("hidden");
+  }
+
+  async function saveEditModal() {
+    if (!editWalletId) return;
+    const label = editLabelEl.value;
+    const notes = editNotesEl.value;
+    try {
+      const updated = await apiPut(`/api/wallets/${editWalletId}`, {
+        label,
+        notes,
+      });
+      wallets = wallets.map((w) =>
+        w.id === updated.id ? { ...w, ...updated } : w
+      );
+      renderAll();
+      closeEditModal();
+    } catch (err) {
+      console.error("Update wallet failed", err);
+      pushToast({
+        type: "info",
+        title: "Failed to update wallet",
+        body: "Check backend logs.",
+        meta: "",
+      });
+    }
+  }
+
+  // Auto check
+  function startAutoCheck() {
+    const interval = clampInterval(autoIntervalEl.value);
+    autoIntervalEl.value = String(interval);
+    if (autoCheckTimer) {
+      clearInterval(autoCheckTimer);
+    }
+    autoCheckTimer = setInterval(() => {
+      triggerCheck(false);
+    }, interval * 1000);
+  }
+
+  function stopAutoCheck() {
+    if (autoCheckTimer) {
+      clearInterval(autoCheckTimer);
+      autoCheckTimer = null;
+    }
+  }
+
+  // Check balances
+  async function triggerCheck(manual = true) {
+    if (wallets.length === 0) {
+      pushToast({
+        type: "info",
+        title: "No wallets to check",
+        body: "Add a wallet first.",
+        meta: "",
+        timeout: 4000,
+      });
+      return;
+    }
+
+    const prevById = new Map();
+    wallets.forEach((w) => {
+      prevById.set(w.id, JSON.parse(JSON.stringify(w)));
+    });
+
+    try {
+      const res = await apiPost("/api/check", {});
+      const newWallets = res.wallets || [];
+      const deposits = res.deposits || [];
+      const totalUsd = Number(res.total_usd || 0);
+
+      wallets = newWallets;
+
+      let changedCount = 0;
+      const changedIds = [];
+      for (const w of wallets) {
+        const prev = prevById.get(w.id);
+        if (!prev) {
+          changedCount++;
+          changedIds.push(w.id);
+        } else {
+          const rawChanged =
+            Number(prev.raw_balance || 0) !== Number(w.raw_balance || 0);
+          const totalUsdPrev = walletTotalUsd(prev);
+          const totalUsdCurr = walletTotalUsd(w);
+          if (rawChanged || totalUsdPrev !== totalUsdCurr) {
+            changedCount++;
+            changedIds.push(w.id);
+          }
+        }
+      }
+
+      // Deposits (native coin-based)
+      if (deposits.length > 0) {
+        deposits.forEach((id) => {
+          const newW = wallets.find((w) => w.id === id);
+          const prevW = prevById.get(id) || {
+            coin_balance: 0,
+            usd_balance: 0,
+            tokens: [],
+          };
+          if (!newW) return;
+          const diffCoin =
+            Number(newW.coin_balance || 0) - Number(prevW.coin_balance || 0);
+          const diffUsd =
+            walletTotalUsd(newW) - walletTotalUsd(prevW);
+
+          if (diffCoin <= 0 && diffUsd <= 0) return;
+
+          try {
+            depositAudio.currentTime = 0;
+            const p = depositAudio.play();
+            if (p && typeof p.then === "function") p.catch(() => {});
+          } catch {
+            // ignore
+          }
+
+          const coinStr = formatCoin(newW.chain, diffCoin > 0 ? diffCoin : newW.coin_balance);
+          const usdStr = formatUSD(diffUsd > 0 ? diffUsd : walletTotalUsd(newW));
+
+          showDesktopDepositNotification({
+            title: "Deposit detected",
+            body: `${coinStr} on ${newW.chain} · ${shortAddress(newW.address)}`,
+          });
+
+          pushToast({
+            type: "deposit",
+            title: "Deposit detected",
+            body: newW.label || shortAddress(newW.address),
+            meta: `${coinStr} · ${usdStr}`,
+            onClick: () => {
+              selectedWalletId = newW.id;
+              const row = document.querySelector(
+                `[data-wallet-row-id="${newW.id}"]`
+              );
+              if (row && row.scrollIntoView) {
+                row.scrollIntoView({ behavior: "smooth", block: "center" });
+              }
+              renderWalletTable();
+            },
+            timeout: 9000,
+          });
+        });
+      }
+
+      if (changedCount > 0) {
+        pushToast({
+          type: "info",
+          title: "Balances updated",
+          body:
+            changedCount === 1
+              ? "1 wallet changed"
+              : `${changedCount} wallets changed`,
+          meta: `Portfolio ${formatUSD(totalUsd)}`,
+          timeout: 7000,
+        });
+      }
+
+      renderAll({ depositIds: deposits });
+    } catch (err) {
+      console.error("Check failed", err);
+      pushToast({
+        type: "info",
+        title: "Check failed",
+        body: "Could not refresh balances. Network or upstream issue.",
+        meta: "",
+      });
+    }
+  }
+
+  // Events
+  function attachEvents() {
+    addWalletBtn.addEventListener("click", addWallet);
+    addAddressEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        addWallet();
+      }
+    });
+
+    bulkImportBtn.addEventListener("click", bulkImport);
+    deleteAllBtn.addEventListener("click", deleteAllWallets);
+
+    autoToggleEl.addEventListener("change", () => {
+      if (autoToggleEl.checked) {
+        startAutoCheck();
+      } else {
+        stopAutoCheck();
+      }
+    });
+
+    autoIntervalEl.addEventListener("change", () => {
+      if (autoToggleEl.checked) {
+        startAutoCheck();
+      }
+    });
+
+    checkNowBtn.addEventListener("click", () => triggerCheck(true));
+
+    filterSearchEl.addEventListener("input", () => {
+      filterSearch = filterSearchEl.value.trim();
+      renderWalletTable();
+    });
+
+    filterMinUsdEl.addEventListener("input", () => {
+      const v = filterMinUsdEl.value;
+      filterMinUsd = v === "" ? null : Number(v);
+      renderWalletTable();
+    });
+
+    filterMaxUsdEl.addEventListener("input", () => {
+      const v = filterMaxUsdEl.value;
+      filterMaxUsd = v === "" ? null : Number(v);
+      renderWalletTable();
+    });
+
+    sortFieldEl.addEventListener("change", () => {
+      sortField = sortFieldEl.value;
+      renderWalletTable();
+    });
+
+    sortDirectionBtn.addEventListener("click", () => {
+      sortDirection = sortDirection === "asc" ? "desc" : "asc";
+      sortDirectionIcon.textContent = sortDirection === "asc" ? "↑" : "↓";
+      renderWalletTable();
+    });
+
+    document
+      .querySelectorAll(".wallet-table th[data-sort-field]")
+      .forEach((th) => {
+        th.addEventListener("click", () => {
+          const field = th.getAttribute("data-sort-field");
+          if (!field) return;
+          if (sortField === field) {
+            sortDirection = sortDirection === "asc" ? "desc" : "asc";
+          } else {
+            sortField = field;
+            sortFieldEl.value = field;
+            sortDirection = "desc";
+          }
+          sortDirectionIcon.textContent = sortDirection === "asc" ? "↑" : "↓";
+          renderWalletTable();
+        });
+      });
+
+    // Modal
+    editModalClose.addEventListener("click", closeEditModal);
+    editModalCancel.addEventListener("click", closeEditModal);
+    editModalSave.addEventListener("click", saveEditModal);
+    editModalEl.addEventListener("click", (e) => {
+      if (e.target === editModalEl) {
+        closeEditModal();
+      }
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !editModalEl.classList.contains("hidden")) {
+        closeEditModal();
+      }
+    });
+  }
+
+  function init() {
+    ensureNotificationPermission();
+    attachEvents();
+    loadWallets();
+  }
+
+  document.addEventListener("DOMContentLoaded", init);
+})();
