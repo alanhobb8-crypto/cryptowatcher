@@ -58,6 +58,7 @@
         <label class="field"><span>Min $</span><input id="filter-min-usd" type="number" inputmode="decimal" placeholder="0"/></label>
         <label class="field"><span>Max $</span><input id="filter-max-usd" type="number" inputmode="decimal" placeholder="∞"/></label>
         <div class="spacer"></div>
+        <button id="pool-btn" class="btn">POOL</button>
         <button id="check-now-btn" class="btn primary">Check now</button>
         <label class="field-inline"><input id="auto-check-toggle" type="checkbox"/><span>Auto</span></label>
         <input id="auto-check-interval" class="interval" type="number" min="15" max="3600" value="60" aria-label="Auto interval (s)"/>
@@ -117,6 +118,77 @@
     </div>
   </div>
 
+  <div id="pool-modal-backdrop" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-title">Pool</div>
+
+    <div id="pool-locked-view">
+      <div class="field">
+        <label>Pool</label>
+        <select id="pool-select"></select>
+      </div>
+
+      <div class="field">
+        <label>Password</label>
+        <input id="pool-password" type="password" placeholder="Password to unlock">
+      </div>
+
+      <div class="modal-actions">
+        <button id="pool-unlock-btn" class="btn">Unlock</button>
+        <button id="pool-create-open-btn" class="btn">Create new</button>
+        <button id="pool-close-btn" class="btn danger">Close</button>
+      </div>
+    </div>
+
+    <div id="pool-create-view" class="hidden">
+      <div class="field">
+        <label>Pool name</label>
+        <input id="pool-create-name" placeholder="e.g. Main pool">
+      </div>
+
+      <div class="field">
+        <label>12-word phrase</label>
+        <textarea id="pool-create-mnemonic" rows="2" placeholder="twelve words..."></textarea>
+      </div>
+
+      <div class="field">
+        <label>Password (encrypts locally)</label>
+        <input id="pool-create-password" type="password" placeholder="Choose a password">
+      </div>
+
+      <div class="field">
+        <label>Accounts to create now</label>
+        <input id="pool-create-count" type="number" min="1" max="50" value="1">
+      </div>
+
+      <div class="modal-actions">
+        <button id="pool-create-btn" class="btn">Create</button>
+        <button id="pool-create-cancel-btn" class="btn danger">Back</button>
+      </div>
+    </div>
+
+    <div id="pool-unlocked-view" class="hidden">
+      <div class="pool-head">
+        <div id="pool-active-name" class="pool-name"></div>
+        <div id="pool-active-total" class="pool-total"></div>
+      </div>
+
+      <div id="pool-accounts-list"></div>
+
+      <div class="modal-actions">
+        <button id="pool-add-account-btn" class="btn">Add account +</button>
+        <button id="pool-lock-btn" class="btn">Lock</button>
+        <button id="pool-close-btn-2" class="btn danger">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
   <script src="/static/script.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tronweb@5.3.1/dist/TronWeb.min.js"></script>
+
 </body>
 </html>
+
